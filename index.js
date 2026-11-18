@@ -83,8 +83,15 @@ app.post("/services",async (req,res)=>{
 
 app.get("/services", async (req, res) => {
   try {
-    const { vendorId } = req.query;
-    const filter = vendorId ? { vendorId: String(vendorId) } : {};
+    const { vendorId,status } = req.query;
+    const filter = {}
+    // const filter = vendorId ? { vendorId: String(vendorId) } : {};
+    if (vendorId){
+      filter.vendorId = vendorId;
+    }
+    if (status){
+      filter.status = status;
+    }
     const services = await serviceCollection
       .find(filter)
       .sort({ createdAt: -1 })
@@ -98,9 +105,31 @@ app.get("/services", async (req, res) => {
 
 
 
-app.put("/services/:id", async (req, res) => {
+app.get("/services/:id", async (req, res) => {
   try {
     const _id = toObjectId(req.params.id);
+    if (!_id) {
+      return res.status(400).json({ message: "Invalid service id" });
+    }
+
+    const service = await serviceCollection.findOne({ _id });
+
+    if (!service) {
+      return res.status(404).json({ message: "Service not found" });
+    }
+
+    res.json(service);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Internal server error" });
+  }
+});
+
+
+
+app.put("/services/:id", async (req, res) => {
+  try {
+    const _id = req.params.id;
     if (!_id) {
       return res.status(400).json({ message: "Invalid service id" });
     }
@@ -162,6 +191,37 @@ app.delete("/services/:id", async (req, res) => {
     res.status(500).json({ message: "Internal server error" });
   }
 });
+
+app.post("/bookings", async (req, res) => {
+  try {
+    const data = req.body
+    const now = new Date().toISOString();
+
+    const result = await db.collection("bookings").insertOne({
+      ...data,
+      createdAt: now,
+      status: "Pending",
+    });
+
+    res.status(201).json(result);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Internal server error" });
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 app.listen(port, () => {
