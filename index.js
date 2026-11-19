@@ -27,6 +27,7 @@ connectToMongoDB()
 const db = client.db("wedplan")
 const collection = db.collection("user")
 const serviceCollection = db.collection("services")
+const bookingCollection = db.collection("bookings")
 
 /** Fields a vendor is allowed to change on an existing listing. */
 const UPDATABLE_SERVICE_FIELDS = [
@@ -210,19 +211,69 @@ app.post("/bookings", async (req, res) => {
   }
 });
 
+app.get("/bookings",async(req,res) => {
+try {
+  const {serviceId,customerId} = req.query;
+  const filter = {}
+  if(serviceId){
+    filter.serviceId = serviceId
+  }
+  if(customerId){
+    filter.customerId = customerId
+  }
+
+  // Service-scoped lookups back the "already requested?" panel, which expects one record.
+  if (serviceId) {
+    const booking = await bookingCollection.findOne(filter)
+    return res.json(booking)
+  }
+
+  // Customer lookups list every request, newest first.
+  const bookings = await bookingCollection
+    .find(filter)
+    .sort({ createdAt: -1 })
+    .toArray()
+  res.json(bookings)
+}catch (err){
+  console.log(err)
+  res.status(500).json({message: "Internal server error"})
+}
+})
 
 
 
 
+/** Deletes a customer's booking request — only while it is still pending. */
+app.delete("/bookings/:id", async (req, res) => {
+  try {
+    const _id = toObjectId(req.params.id);
+    if (!_id) {
+      return res.status(400).json({ message: "Invalid booking id" });
+    }
 
+    const booking = await bookingCollection.findOne({ _id });
+    if (!booking) {
+      return res.status(404).json({ message: "Booking not found" });
+    }
 
+    const status = String(
+      booking.bookingStatus ?? booking.status ?? "Pending"
+    ).toLowerCase();
 
+    if (status !== "pending") {
+      return res
+        .status(403)
+        .json({ message: "Only pending bookings can be deleted" });
+    }
 
+    await bookingCollection.deleteOne({ _id });
 
-
-
-
-
+    res.json({ success: true, deletedId: req.params.id });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Internal server error" });
+  }
+});
 
 app.listen(port, () => {
   console.log(`Server is running on Port ${port}`);
