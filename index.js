@@ -2,10 +2,13 @@ import express from "express";
 import cors from "cors";
 import { MongoClient, ObjectId } from "mongodb";
 import "dotenv/config";
+import Stripe from "stripe";
 
 const app = express();
 const port = 8000;
 const client = new MongoClient(process.env.MONGODB_URI);
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
 
 app.use(express.json())
 app.use(cors());
@@ -25,9 +28,10 @@ connectToMongoDB()
 
 
 const db = client.db("wedplan")
-const collection = db.collection("user")
+const userCollection = db.collection("user")
 const serviceCollection = db.collection("services")
 const bookingCollection = db.collection("bookings")
+const transactionCollection = db.collection("transaction")
 
 /** Fields a vendor is allowed to change on an existing listing. */
 const UPDATABLE_SERVICE_FIELDS = [
@@ -201,7 +205,6 @@ app.post("/bookings", async (req, res) => {
     const result = await db.collection("bookings").insertOne({
       ...data,
       createdAt: now,
-      status: "Pending",
     });
 
     res.status(201).json(result);
@@ -222,11 +225,11 @@ try {
     filter.customerId = customerId
   }
 
-  // Service-scoped lookups back the "already requested?" panel, which expects one record.
-  if (serviceId) {
-    const booking = await bookingCollection.findOne(filter)
-    return res.json(booking)
-  }
+  // // Service-scoped lookups back the "already requested?" panel, which expects one record.
+  // if (serviceId) {
+  //   const booking = await bookingCollection.find(filter)
+  //   return res.json(booking)
+  // }
 
   // Customer lookups list every request, newest first.
   const bookings = await bookingCollection
@@ -274,6 +277,101 @@ app.delete("/bookings/:id", async (req, res) => {
     res.status(500).json({ message: "Internal server error" });
   }
 });
+
+
+
+
+app.post("/create-checkout-session", async (req, res) => {
+  try {
+    const payload = req.body ?? {};
+    console.log("Create checkout session payload:", payload);
+
+    if (!payload.id && !payload.email) {
+      return res.status(400).json({ error: "User ID or email is required" });
+    }
+
+    // Lookup user by ObjectId, string _id, or email
+    const queryConditions = [];
+    const objId = toObjectId(payload.id);
+    if (objId) queryConditions.push({ _id: objId });
+    if (payload.id) queryConditions.push({ _id: payload.id });
+    if (payload.email) queryConditions.push({ email: payload.email });
+
+    const user = await userCollection.findOne({ $or: queryConditions });
+
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const userId = (user._id || payload.id).toString();
+    const userEmail = user.email || payload.email;
+
+    // Record transaction in database with status 'unpaid'
+    const userStatusInfo = {
+      userId,
+      userEmail,
+      amount: 99,
+      plan: "Premium",
+      status: "unpaid",
+      createdAt: new Date(),
+    };
+    const paymentConfirmationResult =
+      await transactionCollection.insertOne(userStatusInfo);
+
+    // Ensure client URL has protocol
+    let clientUrl = process.env.CLIENT_URL || "http://localhost:3000";
+    if (!clientUrl.startsWith("http://") && !clientUrl.startsWith("https://")) {
+      clientUrl = `http://${clientUrl}`;
+    }
+
+    // Create Stripe Checkout session
+    const session = await stripe.checkout.sessions.create({
+      success_url: `${clientUrl}/dashboard/vendor/success_payment?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${clientUrl}/dashboard/vendor/cancel_payment`,
+      customer_email: userEmail,
+      line_items: [
+        {
+          price_data: {
+            currency: "usd",
+            unit_amount: 99 * 100, // $99.00 in cents
+            product_data: {
+              name: "WedPlan Premium Vendor Membership",
+              description: "Unlimited service listings and verified vendor badge",
+            },
+          },
+          quantity: 1,
+        },
+      ],
+      mode: "payment",
+      metadata: {
+        paymentId: paymentConfirmationResult.insertedId.toString(),
+        userId,
+      },
+    });
+
+    console.log("Stripe session created successfully:", session.id);
+    res.json({ success: true, url: session.url, sessionId: session.id });
+  } catch (err) {
+    console.error("Failed to create checkout session:", err);
+    res.status(500).json({
+      error: "Internal server error",
+      message: err.message || "Failed to create checkout session",
+    });
+  }
+});
+
+
+
+// app.get("/create-checkout-session",(req,res)=>{
+//   res.send({ success: true });
+// })
+
+
+
+
+
+
+
 
 app.listen(port, () => {
   console.log(`Server is running on Port ${port}`);
