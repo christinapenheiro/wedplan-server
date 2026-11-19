@@ -350,12 +350,121 @@ app.post("/create-checkout-session", async (req, res) => {
     });
 
     console.log("Stripe session created successfully:", session.id);
+
+    // If there's session.id after stripe checking
+    if (session && session.id) {
+      const ninetyDays = new Date();
+      ninetyDays.setDate(ninetyDays.getDate() + 90);
+
+      // 1. Change the collection "transaction" status to paid
+      await transactionCollection.updateOne(
+        { _id: paymentConfirmationResult.insertedId },
+        {
+          $set: {
+            status: "paid",
+            sessionId: session.id,
+            paidAt: new Date(),
+          },
+        }
+      );
+
+      // 2. Update user collection subscriptionPlan : "Premium" and add subscriptionExpiresAt : (after 90 days)
+      await userCollection.updateOne(
+        { _id: user._id },
+        {
+          $set: {
+            subscriptionPlan: "Premium",
+            subscriptionExpiresAt: ninetyDays,
+          },
+        }
+      );
+    }
+
     res.json({ success: true, url: session.url, sessionId: session.id });
   } catch (err) {
     console.error("Failed to create checkout session:", err);
     res.status(500).json({
       error: "Internal server error",
       message: err.message || "Failed to create checkout session",
+    });
+  }
+});
+
+/**
+ * Verify payment endpoint:
+ * Checks session with Stripe after checkout redirect and ensures transaction
+ * status is updated to "paid" and user subscription is set to "Premium" with 90-day expiry.
+ */
+app.post("/verify-payment", async (req, res) => {
+  try {
+    const { sessionId } = req.body ?? {};
+    if (!sessionId) {
+      return res.status(400).json({ error: "sessionId is required" });
+    }
+
+    // Retrieve and check session from Stripe
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+    if (session && session.id) {
+      const ninetyDays = new Date();
+      ninetyDays.setDate(ninetyDays.getDate() + 90);
+
+      const userId = session.metadata?.userId;
+      const paymentId = session.metadata?.paymentId;
+
+      // 1. Change the collection "transaction" status to paid
+      if (paymentId) {
+        const txId = toObjectId(paymentId);
+        await transactionCollection.updateOne(
+          txId ? { _id: txId } : { _id: paymentId },
+          {
+            $set: {
+              status: "paid",
+              sessionId: session.id,
+              paidAt: new Date(),
+            },
+          }
+        );
+      } else {
+        await transactionCollection.updateMany(
+          { sessionId: session.id },
+          {
+            $set: {
+              status: "paid",
+              paidAt: new Date(),
+            },
+          }
+        );
+      }
+
+      // 2. Update user collection subscriptionPlan: "Premium" and subscriptionExpiresAt: (after 90 days)
+      if (userId) {
+        const userObjId = toObjectId(userId);
+        await userCollection.updateOne(
+          userObjId ? { _id: userObjId } : { _id: userId },
+          {
+            $set: {
+              subscriptionPlan: "Premium",
+              subscriptionExpiresAt: ninetyDays,
+            },
+          }
+        );
+      }
+
+      return res.json({
+        success: true,
+        message: "Subscription activated successfully",
+        subscriptionPlan: "Premium",
+        subscriptionExpiresAt: ninetyDays,
+      });
+    }
+
+    res.status(400).json({ error: "Invalid Stripe session" });
+  } catch (err) {
+    console.error("Payment verification failed:", err);
+    res.status(500).json({
+      error: "Internal server error",
+      message: err.message || "Failed to verify payment",
     });
   }
 });
