@@ -32,6 +32,7 @@ const userCollection = db.collection("user")
 const serviceCollection = db.collection("services")
 const bookingCollection = db.collection("bookings")
 const transactionCollection = db.collection("transaction")
+const sessionCollection = db.collection("session")
 
 /** Fields a vendor is allowed to change on an existing listing. */
 const UPDATABLE_SERVICE_FIELDS = [
@@ -42,6 +43,43 @@ const UPDATABLE_SERVICE_FIELDS = [
   "imageUrls",
   "isAvailable",
 ]
+
+//middleware
+
+
+const verifyToken = async (req,res,next) => {
+  // Check for the Authorization header
+  const authHeader = req.headers.authorization;
+
+  if(!authHeader || !authHeader.startsWith("Bearer ")){
+    return res.status(401).json({message: "Unauthorized"})
+  }
+
+// Extract the token from the header
+  const token = authHeader.split(" ")[1];
+  if(!token){
+    return res.status(401).json({message: "Unauthorized"})
+  }
+
+// Check if the token exists in the user collection
+const query = { token };
+const user = await sessionCollection.findOne(query);
+if(!user){
+  return res.status(401).json({message: "Unauthorized"})
+}
+
+// Attach the user object to the request for further use
+req.user = user
+
+next()
+};
+
+
+
+
+
+
+
 
 /** Converts a route id to an ObjectId, returning null when it is malformed. */
 function toObjectId(id) {
@@ -57,7 +95,7 @@ app.get("/", (req, res) => {
 
 
 
-app.post("/services",async (req,res)=>{
+app.post("/services",verifyToken,async (req,res)=>{
  try {
    const data = req.body ?? {};
    const now = new Date().toISOString();
@@ -67,7 +105,7 @@ app.post("/services",async (req,res)=>{
      price: Number(data.price) || 0,
      imageUrls: Array.isArray(data.imageUrls) ? data.imageUrls : [],
      // New listings wait for admin approval and are bookable until toggled off.
-     status: "Pending",
+     status: "pending",
      isAvailable: true,
      createdAt: now,
      updatedAt: now,
@@ -110,7 +148,7 @@ app.get("/services", async (req, res) => {
 
 
 
-app.get("/services/:id", async (req, res) => {
+app.get("/services/:id",verifyToken, async (req, res) => {
   try {
     const _id = toObjectId(req.params.id);
     if (!_id) {
@@ -132,7 +170,7 @@ app.get("/services/:id", async (req, res) => {
 
 
 
-app.put("/services/:id", async (req, res) => {
+app.put("/services/:id",verifyToken, async (req, res) => {
   try {
     const _id = req.params.id;
     if (!_id) {
@@ -177,7 +215,7 @@ app.put("/services/:id", async (req, res) => {
 
 
 
-app.delete("/services/:id", async (req, res) => {
+app.delete("/services/:id",verifyToken, async (req, res) => {
   try {
     const _id = toObjectId(req.params.id);
     if (!_id) {
@@ -197,7 +235,7 @@ app.delete("/services/:id", async (req, res) => {
   }
 });
 
-app.post("/bookings", async (req, res) => {
+app.post("/bookings",verifyToken, async (req, res) => {
   try {
     const data = req.body
     const now = new Date().toISOString();
@@ -214,7 +252,7 @@ app.post("/bookings", async (req, res) => {
   }
 });
 
-app.get("/bookings",async(req,res) => {
+app.get("/bookings",verifyToken,async(req,res) => {
 try {
   const {serviceId,customerId} = req.query;
   const filter = {}
@@ -247,7 +285,7 @@ try {
 
 
 /** Deletes a customer's booking request — only while it is still pending. */
-app.delete("/bookings/:id", async (req, res) => {
+app.delete("/bookings/:id",verifyToken, async (req, res) => {
   try {
     const _id = toObjectId(req.params.id);
     if (!_id) {
@@ -260,7 +298,7 @@ app.delete("/bookings/:id", async (req, res) => {
     }
 
     const status = String(
-      booking.bookingStatus ?? booking.status ?? "Pending"
+      booking.bookingStatus ?? booking.status ?? "pending"
     ).toLowerCase();
 
     if (status !== "pending") {
@@ -281,7 +319,7 @@ app.delete("/bookings/:id", async (req, res) => {
 
 
 
-app.post("/create-checkout-session", async (req, res) => {
+app.post("/create-checkout-session",verifyToken, async (req, res) => {
   try {
     const payload = req.body ?? {};
     console.log("Create checkout session payload:", payload);
@@ -311,7 +349,7 @@ app.post("/create-checkout-session", async (req, res) => {
       userId,
       userEmail,
       amount: 99,
-      plan: "Premium",
+      plan: "free",
       status: "unpaid",
       createdAt: new Date(),
     };
@@ -373,7 +411,7 @@ app.post("/create-checkout-session", async (req, res) => {
         { _id: user._id },
         {
           $set: {
-            subscriptionPlan: "Premium",
+            subscriptionPlan: "premium",
             subscriptionExpiresAt: ninetyDays,
           },
         }
@@ -444,7 +482,7 @@ app.post("/verify-payment", async (req, res) => {
           userObjId ? { _id: userObjId } : { _id: userId },
           {
             $set: {
-              subscriptionPlan: "Premium",
+              subscriptionPlan: "premium",
               subscriptionExpiresAt: ninetyDays,
             },
           }
@@ -454,7 +492,7 @@ app.post("/verify-payment", async (req, res) => {
       return res.json({
         success: true,
         message: "Subscription activated successfully",
-        subscriptionPlan: "Premium",
+        subscriptionPlan: "premium",
         subscriptionExpiresAt: ninetyDays,
       });
     }
