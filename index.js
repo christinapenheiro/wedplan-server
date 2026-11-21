@@ -32,6 +32,99 @@ app.use(cors());
 
 //stripe webhook
 
+const PREMIUM_PRICE_CENTS = 9900;
+const PREMIUM_DURATION_DAYS = 90;
+
+/**
+ * Marks the transaction for a paid Checkout Session as "paid" and upgrades the
+ * matching user to Premium for 90 days. Idempotent, so the Stripe webhook and
+ * /verify-payment can both call it without activating the plan twice.
+ */
+async function activatePremiumSubscription(session) {
+  const userId = session?.metadata?.userId;
+  const paymentId = session?.metadata?.paymentId;
+
+  if (!userId || !paymentId) {
+    return { found: false, reason: "missing-metadata" };
+  }
+
+  const txId = toObjectId(paymentId);
+
+  if (!txId) {
+    return { found: false, reason: "invalid-payment-id" };
+  }
+
+  // Find the original transaction created by /create-checkout-session
+  const transaction = await transactionCollection.findOne({
+    _id: txId,
+    userId,
+    sessionId: session.id,
+    amount: 99,
+    currency: "usd",
+    plan: "premium",
+  });
+
+  if (!transaction) {
+    return { found: false, reason: "transaction-not-found" };
+  }
+
+  let paidTransaction = transaction;
+
+  // Only stamp the transaction the first time; later calls reuse the expiry
+  if (transaction.status !== "paid") {
+    const paidAt = new Date();
+    const expiresAt = new Date(paidAt);
+    expiresAt.setDate(expiresAt.getDate() + PREMIUM_DURATION_DAYS);
+
+    const updateResult = await transactionCollection.updateOne(
+      { _id: txId, status: "unpaid" },
+      {
+        $set: {
+          status: "paid",
+          paidAt,
+          subscriptionExpiresAt: expiresAt,
+          paymentIntent: session.payment_intent ?? null,
+        },
+      },
+    );
+
+    paidTransaction =
+      updateResult.modifiedCount === 1
+        ? {
+            ...transaction,
+            status: "paid",
+            paidAt,
+            subscriptionExpiresAt: expiresAt,
+          }
+        : await transactionCollection.findOne({ _id: txId });
+  }
+
+  const subscriptionExpiresAt =
+    paidTransaction?.subscriptionExpiresAt ??
+    (() => {
+      const expiresAt = new Date();
+      expiresAt.setDate(expiresAt.getDate() + PREMIUM_DURATION_DAYS);
+      return expiresAt;
+    })();
+
+  const userObjId = toObjectId(userId);
+  const userResult = await userCollection.updateOne(
+    userObjId ? { _id: userObjId } : { _id: userId },
+    {
+      $set: {
+        subscriptionPlan: "premium",
+        subscriptionExpiresAt,
+      },
+    },
+  );
+
+  if (userResult.matchedCount !== 1) {
+    return { found: true, userId, reason: "user-not-found" };
+  }
+
+  return { found: true, userId, subscriptionExpiresAt };
+}
+
 app.post(
   "/stripe-webhook",
   express.raw({ type: "application/json" }),
@@ -55,102 +148,44 @@ app.post(
     }
 
     // 2. Handle successful Checkout payment
-    if (event.type === "checkout.session.completed") {
+    if (
+      event.type === "checkout.session.completed" ||
+      event.type === "checkout.session.async_payment_succeeded"
+    ) {
       try {
         const session = event.data.object;
         console.log("Payment status:", session.payment_status);
         console.log("Session ID:", session.id);
         console.log("Payment metadata:", session.metadata);
+
         // Confirm payment details
         if (
           session.payment_status !== "paid" ||
           session.mode !== "payment" ||
-          session.amount_total !== 9900 ||
+          session.amount_total !== PREMIUM_PRICE_CENTS ||
           session.currency !== "usd"
         ) {
           console.log("Payment not eligible for activation");
           return res.json({ received: true });
         }
 
-        const paymentId = session.metadata?.paymentId;
-        const userId = session.metadata?.userId;
+        // 3. Mark transaction paid + activate premium (idempotent)
+        const result = await activatePremiumSubscription(session);
 
-        if (!paymentId || !userId) {
-          console.error("Missing payment metadata");
-          return res.status(400).send("Missing payment metadata");
-        }
-
-        const txId = toObjectId(paymentId);
-
-        if (!txId) {
-          console.error("Invalid payment ID:", paymentId);
-          return res.status(400).send("Invalid payment ID");
-        }
-
-        // 3. Find the original unpaid transaction
-        const transaction = await transactionCollection.findOne({
-          _id: txId,
-          userId,
-          sessionId: session.id,
-          status: "unpaid",
-          amount: 99,
-          currency: "usd",
-          plan: "premium",
-        });
-
-        // Already processed or transaction not found
-        if (!transaction) {
-          console.log("Transaction already processed or not found:", paymentId);
+        if (!result.found) {
+          console.error(
+            "Paid session has no matching transaction:",
+            result.reason,
+            session.id,
+          );
           return res.json({ received: true });
         }
 
-        console.log("Transaction found:", transaction);
-
-        // 4. Calculate subscription expiry
-        const paidAt = new Date();
-        const expiresAt = new Date(paidAt);
-        expiresAt.setDate(expiresAt.getDate() + 90);
-
-        // 5. Mark transaction as paid
-        const updateResult = await transactionCollection.updateOne(
-          {
-            _id: txId,
-            userId,
-            sessionId: session.id,
-            status: "unpaid",
-          },
-          {
-            $set: {
-              status: "paid",
-              paidAt,
-              subscriptionExpiresAt: expiresAt,
-              paymentIntent: session.payment_intent,
-            },
-          },
-        );
-
-        console.log("Transaction update result:", updateResult);
-
-        // 6. Activate premium only once
-        if (updateResult.modifiedCount === 1) {
-          const userObjId = toObjectId(userId);
-
-          const userResult = await userCollection.updateOne(
-            userObjId ? { _id: userObjId } : { _id: userId },
-            {
-              $set: {
-                subscriptionPlan: "premium",
-                subscriptionExpiresAt: expiresAt,
-              },
-            },
-          );
-
-          if (userResult.matchedCount !== 1) {
-            throw new Error("User not found during subscription activation");
-          }
-
-          console.log("Premium subscription activated:", userId);
+        if (result.reason === "user-not-found") {
+          throw new Error("User not found during subscription activation");
         }
+
+        console.log("Premium subscription activated:", result.userId);
       } catch (err) {
         console.error("Webhook processing error:", err);
 
@@ -928,7 +963,7 @@ app.post("/verify-payment", verifyToken, verifyUser, async (req, res) => {
 
     if (
       session.mode !== "payment" ||
-      session.amount_total !== 9900 ||
+      session.amount_total !== PREMIUM_PRICE_CENTS ||
       session.currency !== "usd"
     ) {
       return res.status(400).json({
@@ -936,37 +971,37 @@ app.post("/verify-payment", verifyToken, verifyUser, async (req, res) => {
       });
     }
 
-    // 3. Find the corresponding transaction
-    const paymentId = session.metadata?.paymentId;
-    const txId = toObjectId(paymentId);
-
-    if (!txId) {
-      return res.status(400).json({
-        error: "Invalid payment reference",
-      });
-    }
-
-    const transaction = await transactionCollection.findOne({
-      _id: txId,
-      userId,
-      sessionId: session.id,
-      amount: 99,
-      currency: "usd",
-      plan: "premium",
-    });
-
-    if (!transaction) {
-      return res.status(404).json({
-        error: "Payment transaction not found",
-      });
-    }
-
-    // 4. Check actual payment status
-    if (session.payment_status !== "paid" || transaction.status !== "paid") {
+    // 3. Stripe has not confirmed the money yet (e.g. delayed payment method)
+    if (session.payment_status !== "paid") {
       return res.status(200).json({
         success: false,
         status: "pending",
         message: "Payment is awaiting confirmation",
+      });
+    }
+
+    // 4. Rediscover the transaction and activate premium. Stripe already
+    // confirmed the payment above, so this also covers a missed webhook.
+    const result = await activatePremiumSubscription(session);
+
+    if (!result.found) {
+      const reason = result.reason;
+      const statusCode =
+        reason === "transaction-not-found" || reason === "invalid-payment-id"
+          ? 404
+          : 400;
+
+      return res.status(statusCode).json({
+        error:
+          reason === "transaction-not-found"
+            ? "Payment transaction not found"
+            : "Invalid payment reference",
+      });
+    }
+
+    if (result.reason === "user-not-found") {
+      return res.status(404).json({
+        error: "User not found for this payment",
       });
     }
 
