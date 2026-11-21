@@ -154,9 +154,9 @@ app.post(
     ) {
       try {
         const session = event.data.object;
-        console.log("Payment status:", session.payment_status);
-        console.log("Session ID:", session.id);
-        console.log("Payment metadata:", session.metadata);
+        // console.log("Payment status:", session.payment_status);
+        // console.log("Session ID:", session.id);
+        // console.log("Payment metadata:", session.metadata);
 
         // Confirm payment details
         if (
@@ -211,6 +211,9 @@ const UPDATABLE_SERVICE_FIELDS = [
   "imageUrls",
   "isAvailable",
 ];
+
+/** Status values an admin may assign when moderating a listing. */
+const MODERABLE_SERVICE_STATUSES = ["active", "declined"];
 
 /** Converts a route id to an ObjectId, returning null when it is malformed. */
 function toObjectId(id) {
@@ -304,6 +307,15 @@ const isAuthenticVendor = async (req, res, next) => {
 const verifyCustomer = async (req, res, next) => {
   // console.log(req.findUser.accountType)
   if (req.findUser.accountType !== "customer") {
+    return res.status(403).json({ message: "Forbidden" });
+  }
+  next();
+};
+
+//checks if the user is an admin — role is written by the Better Auth admin plugin
+const verifyAdmin = async (req, res, next) => {
+  const role = String(req.findUser?.role ?? "").toLowerCase();
+  if (role !== "admin") {
     return res.status(403).json({ message: "Forbidden" });
   }
   next();
@@ -437,6 +449,48 @@ app.put(
       const updated = await serviceCollection.findOneAndUpdate(
         { _id: new ObjectId(_id) },
         { $set: updates },
+        { returnDocument: "after" },
+      );
+
+      if (!updated) {
+        return res.status(404).json({ message: "Service not found" });
+      }
+
+      res.json(updated);
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  },
+);
+
+/**
+ * Admin-only moderation endpoint — approves (active) or declines a listing so
+ * it enters/leaves the public directory. Kept separate from the vendor PUT so
+ * only admins can change `status`.
+ */
+app.put(
+  "/services/:id/status",
+  verifyToken,
+  verifyUser,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const _id = toObjectId(req.params.id);
+      if (!_id) {
+        return res.status(400).json({ message: "Invalid service id" });
+      }
+
+      const { status } = req.body ?? {};
+      if (!MODERABLE_SERVICE_STATUSES.includes(status)) {
+        return res
+          .status(400)
+          .json({ message: "Status must be 'active' or 'declined'" });
+      }
+
+      const updated = await serviceCollection.findOneAndUpdate(
+        { _id },
+        { $set: { status, updatedAt: new Date().toISOString() } },
         { returnDocument: "after" },
       );
 
@@ -865,79 +919,6 @@ app.post(
  * Checks session with Stripe after checkout redirect and ensures transaction
  * status is updated to "paid" and user subscription is set to "Premium" with 90-day expiry.
  */
-// app.post("/verify-payment", async (req, res) => {
-//   try {
-//     const { sessionId } = req.body ?? {};
-//     if (!sessionId) {
-//       return res.status(400).json({ error: "sessionId is required" });
-//     }
-
-//     // Retrieve and check session from Stripe
-//     const session = await stripe.checkout.sessions.retrieve(sessionId);
-
-//     if (session && session.id) {
-//       const ninetyDays = new Date();
-//       ninetyDays.setDate(ninetyDays.getDate() + 90);
-
-//       const userId = session.metadata?.userId;
-//       const paymentId = session.metadata?.paymentId;
-
-//       // 1. Change the collection "transaction" status to paid
-//       if (paymentId) {
-//         const txId = toObjectId(paymentId);
-//         await transactionCollection.updateOne(
-//           txId ? { _id: txId } : { _id: paymentId },
-//           {
-//             $set: {
-//               status: "paid",
-//               sessionId: session.id,
-//               paidAt: new Date(),
-//             },
-//           },
-//         );
-//       } else {
-//         await transactionCollection.updateMany(
-//           { sessionId: session.id },
-//           {
-//             $set: {
-//               status: "paid",
-//               paidAt: new Date(),
-//             },
-//           },
-//         );
-//       }
-
-//       // 2. Update user collection subscriptionPlan: "Premium" and subscriptionExpiresAt: (after 90 days)
-//       if (userId) {
-//         const userObjId = toObjectId(userId);
-//         await userCollection.updateOne(
-//           userObjId ? { _id: userObjId } : { _id: userId },
-//           {
-//             $set: {
-//               subscriptionPlan: "premium",
-//               subscriptionExpiresAt: ninetyDays,
-//             },
-//           },
-//         );
-//       }
-
-//       return res.json({
-//         success: true,
-//         message: "Subscription activated successfully",
-//         subscriptionPlan: "premium",
-//         subscriptionExpiresAt: ninetyDays,
-//       });
-//     }
-
-//     res.status(400).json({ error: "Invalid Stripe session" });
-//   } catch (err) {
-//     console.error("Payment verification failed:", err);
-//     res.status(500).json({
-//       error: "Internal server error",
-//       message: err.message || "Failed to verify payment",
-//     });
-//   }
-// });
 
 app.post("/verify-payment", verifyToken, verifyUser, async (req, res) => {
   try {
