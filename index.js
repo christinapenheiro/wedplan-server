@@ -303,6 +303,14 @@ const isAuthenticVendor = async (req, res, next) => {
   next();
 };
 
+const isAuthenticBookingVendor = async (req, res, next) => {
+  const { vendorId} = req.query;
+  if (vendorId !== req.findUser._id.toString()) {
+    return res.status(403).json({ message: "Forbidden" });
+  }
+  next();
+};
+
 //checks if the user is customer , not vendor or admin
 const verifyCustomer = async (req, res, next) => {
   // console.log(req.findUser.accountType)
@@ -376,20 +384,71 @@ app.post(
   },
 );
 
+
+
+app.get("/featured", async (req, res) => {
+  try {
+    const result = await serviceCollection
+      .find({ status: "active" })
+      .limit(6)
+      .sort({ createdAt: -1 })
+      .toArray();
+    res.json(result);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Internal server error" });
+  }
+});
+
+
+
 app.get("/services", async (req, res) => {
   try {
-    const { vendorId, status } = req.query;
+    const { vendorId, status, search, category, location, sort } = req.query;
     const filter = {};
     // const filter = vendorId ? { vendorId: String(vendorId) } : {};
     if (vendorId) {
       filter.vendorId = vendorId;
     }
-    if (status) {
+    if (status && status !== "all") {
       filter.status = status;
     }
+    if (category && category !== "all") {
+      filter.category = category;
+    }
+    if (location && typeof location === "string" && location.trim()) {
+      filter.location = { $regex: location.trim(), $options: "i" };
+    }
+    if (search && typeof search === "string" && search.trim()) {
+      const searchRegex = { $regex: search.trim(), $options: "i" };
+      filter.$or = [
+        { title: searchRegex },
+        { description: searchRegex },
+        { location: searchRegex },
+        { vendorName: searchRegex },
+        { vendorEmail: searchRegex },
+      ];
+    }
+
+    // Sort options mapping
+    let sortOption = { createdAt: -1 };
+    if (sort === "price-low" || sort === "price-asc") {
+      sortOption = { price: 1 };
+    } else if (sort === "price-high" || sort === "price-desc") {
+      sortOption = { price: -1 };
+    } else if (sort === "oldest") {
+      sortOption = { createdAt: 1 };
+    } else if (sort === "name-asc") {
+      sortOption = { title: 1 };
+    } else if (sort === "name-desc") {
+      sortOption = { title: -1 };
+    } else if (sort === "newest") {
+      sortOption = { createdAt: -1 };
+    }
+
     const services = await serviceCollection
       .find(filter)
-      .sort({ createdAt: -1 })
+      .sort(sortOption)
       .toArray();
     res.json(services);
   } catch (err) {
@@ -465,6 +524,149 @@ app.put(
 );
 
 /**
+ * Admin: Get all registered users directory with optional role & search filtering.
+ */
+app.get(
+  "/users",
+  verifyToken,
+  verifyUser,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const { search, role } = req.query;
+      const filter = {};
+
+      if (role && role !== "all") {
+        if (role === "admin") {
+          filter.role = "admin";
+        } else {
+          filter.accountType = role;
+        }
+      }
+
+      if (search) {
+        filter.$or = [
+          { name: { $regex: search, $options: "i" } },
+          { email: { $regex: search, $options: "i" } },
+          { businessName: { $regex: search, $options: "i" } },
+        ];
+      }
+
+      const users = await userCollection
+        .find(filter, { projection: { password: 0 } })
+        .sort({ createdAt: -1 })
+        .toArray();
+
+      res.json(users);
+    } catch (err) {
+      console.error("Admin get users error:", err);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  },
+);
+
+/**
+ * Admin: Block or unblock a registered user.
+ */
+const handleBlockUser = async (req, res) => {
+  try {
+    const rawId = req.params.id;
+    const objId = toObjectId(rawId);
+    const filter = objId ? { $or: [{ _id: objId }, { _id: rawId }] } : { _id: rawId };
+
+    const targetUser = await userCollection.findOne(filter);
+    if (!targetUser) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Prevent admin from blocking their own account
+    if (targetUser._id.toString() === req.findUser._id.toString()) {
+      return res
+        .status(400)
+        .json({ message: "You cannot block your own admin account" });
+    }
+
+    const { isBlocked } = req.body ?? {};
+    const blockState = Boolean(isBlocked);
+
+    await userCollection.updateOne(filter, {
+      $set: {
+        isBlocked: blockState,
+        banned: blockState,
+        updatedAt: new Date().toISOString(),
+      },
+    });
+
+    res.json({
+      success: true,
+      userId: rawId,
+      isBlocked: blockState,
+      message: blockState ? "User has been blocked" : "User has been unblocked",
+    });
+  } catch (err) {
+    console.error("Admin block/unblock error:", err);
+    res.status(500).json({ message: "Internal server error" });
+  }
+};
+
+app.put("/users/:id/block", verifyToken, verifyUser, verifyAdmin, handleBlockUser);
+app.patch("/users/:id/block", verifyToken, verifyUser, verifyAdmin, handleBlockUser);
+
+/**
+ * Admin: Get all transactions audit logs.
+ * Note: Payment status is determined solely by Stripe events.
+ * Admins are not allowed to manually modify payment records.
+ */
+app.get(
+  "/transactions",
+  verifyToken,
+  verifyUser,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const transactions = await transactionCollection
+        .find({})
+        .sort({ createdAt: -1 })
+        .toArray();
+
+      const userIds = Array.from(
+        new Set(transactions.map((t) => t.userId).filter(Boolean)),
+      );
+      const objIds = userIds.map(toObjectId).filter(Boolean);
+
+      const queryOr = [];
+      if (objIds.length > 0) queryOr.push({ _id: { $in: objIds } });
+      if (userIds.length > 0) queryOr.push({ _id: { $in: userIds } });
+
+      let users = [];
+      if (queryOr.length > 0) {
+        users = await userCollection.find({ $or: queryOr }).toArray();
+      }
+
+      const userMap = new Map();
+      users.forEach((u) => {
+        userMap.set(u._id.toString(), u);
+      });
+
+      const enrichedTransactions = transactions.map((t) => {
+        const vendor = t.userId ? userMap.get(t.userId.toString()) : null;
+        return {
+          ...t,
+          vendorName: vendor?.name || null,
+          vendorBusinessName: vendor?.businessName || null,
+          vendorImage: vendor?.image || null,
+        };
+      });
+
+      res.json(enrichedTransactions);
+    } catch (err) {
+      console.error("Admin transactions error:", err);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  },
+);
+
+/**
  * Admin-only moderation endpoint — approves (active) or declines a listing so
  * it enters/leaves the public directory. Kept separate from the vendor PUT so
  * only admins can change `status`.
@@ -510,13 +712,41 @@ app.delete(
   "/services/:id",
   verifyToken,
   verifyUser,
-  verifyVendor,
-  isAuthenticVendor,
   async (req, res) => {
     try {
       const _id = toObjectId(req.params.id);
       if (!_id) {
         return res.status(400).json({ message: "Invalid service id" });
+      }
+
+      const role = String(
+        req.findUser?.role ?? req.findUser?.accountType ?? ""
+      ).toLowerCase();
+      const isAdmin = role === "admin";
+      const isVendor =
+        role === "vendor" || req.findUser?.accountType === "vendor";
+
+      if (!isAdmin && !isVendor) {
+        return res.status(403).json({
+          message: "Forbidden: Only admins and vendors can delete services",
+        });
+      }
+
+      // If vendor (and not admin), verify ownership of the service
+      if (!isAdmin) {
+        const service = await serviceCollection.findOne({ _id });
+        if (!service) {
+          return res.status(404).json({ message: "Service not found" });
+        }
+        const userIdStr = req.findUser._id ? req.findUser._id.toString() : "";
+        if (
+          service.vendorId !== userIdStr &&
+          service.vendorEmail !== req.findUser.email
+        ) {
+          return res.status(403).json({
+            message: "Forbidden: You can only delete your own services",
+          });
+        }
       }
 
       const result = await serviceCollection.deleteOne({ _id });
@@ -525,7 +755,11 @@ app.delete(
         return res.status(404).json({ message: "Service not found" });
       }
 
-      res.json({ success: true, deletedId: req.params.id });
+      res.json({
+        success: true,
+        deletedId: req.params.id,
+        message: "Service deleted successfully",
+      });
     } catch (err) {
       console.error(err);
       res.status(500).json({ message: "Internal server error" });
@@ -591,6 +825,95 @@ app.get(
     }
   },
 );
+
+
+
+app.get("/bookings/vendor",verifyToken, verifyUser, verifyVendor, isAuthenticBookingVendor, async (req, res) => {
+  try {
+    const { vendorId, vendorEmail } = req.query;
+    const filter = {};
+    if (vendorId && vendorEmail) {
+      filter.$or = [{ vendorId }, { vendorEmail }];
+    } else if (vendorId) {
+      filter.vendorId = vendorId;
+    } else if (vendorEmail) {
+      filter.vendorEmail = vendorEmail;
+    }
+
+    const bookings = await bookingCollection
+      .find(filter)
+      .sort({ createdAt: -1 })
+      .toArray();
+    res.json(bookings);
+  } catch (err) {
+    console.log(err);
+    res.status(500).json({ message: "Internal server error" });
+  }
+});
+
+/**
+ * Updates a booking request status (accept or reject).
+ * Rules:
+ * 1. Only pending requests can be accepted or rejected.
+ * 2. Once accepted or rejected, a request cannot be processed again.
+ */
+const updateBookingStatusHandler = async (req, res) => {
+  try {
+    const rawId = req.params.id;
+    const objId = toObjectId(rawId);
+    const filter = objId ? { $or: [{ _id: objId }, { _id: rawId }] } : { _id: rawId };
+
+    const booking = await bookingCollection.findOne(filter);
+    if (!booking) {
+      return res.status(404).json({ message: "Booking not found" });
+    }
+
+    const currentStatus = String(
+      booking.bookingStatus ?? booking.status ?? "pending"
+    ).toLowerCase();
+
+    // Rule: Only pending requests can be processed. Once accepted or rejected, cannot be processed again.
+    if (currentStatus !== "pending") {
+      return res.status(400).json({
+        message: "Once accepted or rejected, a request cannot be processed again",
+      });
+    }
+
+    const { status, bookingStatus } = req.body ?? {};
+    const inputStatus = String(bookingStatus ?? status ?? "").toLowerCase();
+
+    if (!["accepted", "rejected", "declined"].includes(inputStatus)) {
+      return res.status(400).json({
+        message: "Status must be 'accepted', 'rejected', or 'declined'",
+      });
+    }
+
+    // Standardize status: store both bookingStatus and status for compatibility
+    const targetStatus = inputStatus === "declined" ? "rejected" : inputStatus;
+
+    await bookingCollection.updateOne(filter, {
+      $set: {
+        bookingStatus: targetStatus,
+        status: targetStatus,
+        updatedAt: new Date().toISOString(),
+      },
+    });
+
+    res.json({
+      success: true,
+      status: targetStatus,
+      message: `Booking request has been ${targetStatus}`,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Internal server error" });
+  }
+};
+
+app.put("/bookings/:id/status",verifyToken, verifyUser,verifyVendor, updateBookingStatusHandler);
+app.patch("/bookings/:id/status", verifyToken, verifyUser,verifyVendor, updateBookingStatusHandler);
+app.put("/bookings/:id", verifyToken, verifyUser, updateBookingStatusHandler);
+app.patch("/bookings/:id", verifyToken, verifyUser, updateBookingStatusHandler);
 
 /** Deletes a customer's booking request — only while it is still pending. */
 app.delete(
