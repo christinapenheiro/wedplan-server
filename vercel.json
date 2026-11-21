@@ -1,20 +1,15 @@
 {
   "version": 2,
-  "cleanUrls": true,
-  "redirects": [
-    { "source": "/old-path", "destination": "/new-path", "permanent": true }
-  ],
-  "rewrites": [{ "source": "/api/(.*)", "destination": "/api/handler.js" }],
-  "headers": [
+  "builds": [
     {
-      "source": "/(.*)",
-      "headers": [{ "key": "X-Content-Type-Options", "value": "nosniff" }]
+      "src": "index.js",
+      "use": "@vercel/node"
     }
   ],
-  "crons": [
+  "routes": [
     {
-      "path": "/api/cron-job",
-      "schedule": "0 0 * * *"
+      "src": "/(.*)",
+      "dest": "index.js"
     }
   ]
 }
