@@ -5,7 +5,7 @@ import "dotenv/config";
 import Stripe from "stripe";
 
 const app = express();
-const port = 8000;
+const port = process.env.PORT || 8000;
 const client = new MongoClient(process.env.MONGODB_URI);
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
@@ -28,12 +28,30 @@ const bookingCollection = db.collection("bookings");
 const transactionCollection = db.collection("transaction");
 const sessionCollection = db.collection("session");
 
-app.use(cors());
-
-//stripe webhook
+// =============================================================================
+// CONSTANTS & HELPERS
+// =============================================================================
 
 const PREMIUM_PRICE_CENTS = 9900;
 const PREMIUM_DURATION_DAYS = 90;
+
+/** Fields a vendor is allowed to change on an existing listing. */
+const UPDATABLE_SERVICE_FIELDS = [
+  "title",
+  "category",
+  "price",
+  "description",
+  "imageUrls",
+  "isAvailable",
+];
+
+/** Status values an admin may assign when moderating a listing. */
+const MODERABLE_SERVICE_STATUSES = ["active", "declined"];
+
+/** Converts a route id to an ObjectId, returning null when it is malformed. */
+function toObjectId(id) {
+  return ObjectId.isValid(id) ? new ObjectId(id) : null;
+}
 
 /**
  * Marks the transaction for a paid Checkout Session as "paid" and upgrades the
@@ -49,7 +67,6 @@ async function activatePremiumSubscription(session) {
   }
 
   const txId = toObjectId(paymentId);
-
   if (!txId) {
     return { found: false, reason: "invalid-payment-id" };
   }
@@ -125,74 +142,50 @@ async function activatePremiumSubscription(session) {
   return { found: true, userId, subscriptionExpiresAt };
 }
 
+// =============================================================================
+// GLOBAL PRE-ROUTING MIDDLEWARE & WEBHOOKS
+// =============================================================================
+
+app.use(cors());
+
+/**
+ * Stripe Webhook — must be mounted with express.raw before express.json()
+ * so Stripe can verify the cryptographic signature against the raw body buffer.
+ */
 app.post(
   "/stripe-webhook",
   express.raw({ type: "application/json" }),
   async (req, res) => {
     let event;
 
-    // 1. Verify Stripe webhook signature
     try {
       const signature = req.headers["stripe-signature"];
-
       event = stripe.webhooks.constructEvent(
         req.body,
         signature,
         process.env.STRIPE_WEBHOOK_SECRET,
       );
-
       console.log("Received Stripe event:", event.type);
     } catch (err) {
       console.error("Webhook verification failed:", err.message);
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
-    // 2. Handle successful Checkout payment
-    if (
-      event.type === "checkout.session.completed" ||
-      event.type === "checkout.session.async_payment_succeeded"
-    ) {
-      try {
-        const session = event.data.object;
-        // console.log("Payment status:", session.payment_status);
-        // console.log("Session ID:", session.id);
-        // console.log("Payment metadata:", session.metadata);
+    if (event.type === "checkout.session.completed") {
+      const checkoutSession = event.data.object;
 
-        // Confirm payment details
-        if (
-          session.payment_status !== "paid" ||
-          session.mode !== "payment" ||
-          session.amount_total !== PREMIUM_PRICE_CENTS ||
-          session.currency !== "usd"
-        ) {
-          console.log("Payment not eligible for activation");
-          return res.json({ received: true });
-        }
+      if (checkoutSession.mode !== "payment") {
+        return res.json({ received: true });
+      }
 
-        // 3. Mark transaction paid + activate premium (idempotent)
-        const result = await activatePremiumSubscription(session);
+      const result = await activatePremiumSubscription(checkoutSession);
 
-        if (!result.found) {
-          console.error(
-            "Paid session has no matching transaction:",
-            result.reason,
-            session.id,
-          );
-          return res.json({ received: true });
-        }
-
-        if (result.reason === "user-not-found") {
-          throw new Error("User not found during subscription activation");
-        }
-
-        console.log("Premium subscription activated:", result.userId);
-      } catch (err) {
-        console.error("Webhook processing error:", err);
-
-        // Return 500 so Stripe retries the webhook.
-        return res.status(500).json({
-          error: "Webhook processing failed",
-        });
+      if (!result.found) {
+        console.warn(
+          "Stripe webhook skipped activation:",
+          result.reason,
+          checkoutSession.id,
+        );
       }
     }
 
@@ -200,59 +193,36 @@ app.post(
   },
 );
 
+// Standard body parser for all subsequent JSON endpoints
 app.use(express.json());
 
-/** Fields a vendor is allowed to change on an existing listing. */
-const UPDATABLE_SERVICE_FIELDS = [
-  "title",
-  "category",
-  "price",
-  "description",
-  "imageUrls",
-  "isAvailable",
-];
+// =============================================================================
+// AUTHENTICATION & AUTHORIZATION MIDDLEWARES
+// =============================================================================
 
-/** Status values an admin may assign when moderating a listing. */
-const MODERABLE_SERVICE_STATUSES = ["active", "declined"];
-
-/** Converts a route id to an ObjectId, returning null when it is malformed. */
-function toObjectId(id) {
-  return ObjectId.isValid(id) ? new ObjectId(id) : null;
-}
-
-//middleware
-
-//checks if the token is verified
+/** Checks for a valid Bearer token in session collection */
 const verifyToken = async (req, res, next) => {
-  // Check for the Authorization header
   const authHeader = req.headers.authorization;
 
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
     return res.status(401).json({ message: "Unauthorized" });
   }
 
-  // Extract the token from the header
   const token = authHeader.split(" ")[1];
   if (!token) {
     return res.status(401).json({ message: "Unauthorized" });
   }
 
-  // Check if the token exists in the user collection
-  const query = { token };
-  const user = await sessionCollection.findOne(query);
+  const user = await sessionCollection.findOne({ token });
   if (!user) {
     return res.status(401).json({ message: "Unauthorized" });
   }
 
-  // Attach the user object to the request for further use
-
   req.user = user;
-
   next();
 };
 
-//must call this after verify token to verify user
-//Identify who the user is or find the user in the database of usercollection
+/** Resolves the authenticated user from the database */
 const verifyUser = async (req, res, next) => {
   const userId = toObjectId(req.user.userId);
   const findUser = await userCollection.findOne({ _id: userId });
@@ -261,19 +231,20 @@ const verifyUser = async (req, res, next) => {
     return res.status(401).json({ message: "Unauthorized" });
   }
   req.findUser = findUser;
-
   next();
 };
 
-//checks if the user is a vendor
+/** Checks if the user is a vendor */
 const verifyVendor = async (req, res, next) => {
-  if (req.findUser.accountType !== "vendor") {
+  const accountType = req.findUser?.accountType;
+  const role = req.findUser?.role;
+  if (accountType !== "vendor" && role !== "vendor") {
     return res.status(403).json({ message: "Forbidden" });
   }
   next();
 };
 
-//checks vendor  authorization of how many posts can a vendor have if his subscription plan is free
+/** Enforces the vendor's free post limit */
 const vendorAuthorization = async (req, res, next) => {
   req.subscriptionPlan = req.findUser.subscriptionPlan;
   const vendorPostingCount = await serviceCollection.countDocuments({
@@ -290,37 +261,59 @@ const vendorAuthorization = async (req, res, next) => {
   next();
 };
 
-//checks that if the real vendor is trying to update the service
+/** Ensures the authenticated vendor owns the targeted service */
 const isAuthenticVendor = async (req, res, next) => {
-  const id = toObjectId(req.params.id);
-  if (!id) {
-    return res.status(400).json({ message: "Invalid service id" });
+  try {
+    const id = toObjectId(req.params.id);
+    if (!id) {
+      return res.status(400).json({ message: "Invalid service id" });
+    }
+    const service = await serviceCollection.findOne({ _id: id });
+    if (!service) {
+      return res.status(404).json({ message: "Service not found" });
+    }
+    const currentUserId = req.findUser._id.toString();
+    const currentUserEmail = req.findUser.email;
+
+    if (
+      service.vendorId !== currentUserId &&
+      service.vendorEmail !== currentUserEmail
+    ) {
+      return res
+        .status(403)
+        .json({ message: "Forbidden: You do not own this service" });
+    }
+    next();
+  } catch (err) {
+    console.error("isAuthenticVendor error:", err);
+    return res.status(500).json({ message: "Internal server error" });
   }
-  const findUserById = await serviceCollection.findOne({ _id: id });
-  if (findUserById.vendorId === req.findUser._id) {
-    res.status(403).json({ message: "Forbidden" });
-  }
-  next();
 };
 
+/** Ensures vendor query matches current user */
 const isAuthenticBookingVendor = async (req, res, next) => {
-  const { vendorId} = req.query;
-  if (vendorId !== req.findUser._id.toString()) {
+  const { vendorId, vendorEmail } = req.query;
+  const currentUserId = req.findUser._id.toString();
+  const currentUserEmail = req.findUser.email;
+
+  if (vendorId && vendorId !== currentUserId) {
+    return res.status(403).json({ message: "Forbidden" });
+  }
+  if (vendorEmail && vendorEmail !== currentUserEmail) {
     return res.status(403).json({ message: "Forbidden" });
   }
   next();
 };
 
-//checks if the user is customer , not vendor or admin
+/** Checks if the user is a customer */
 const verifyCustomer = async (req, res, next) => {
-  // console.log(req.findUser.accountType)
   if (req.findUser.accountType !== "customer") {
     return res.status(403).json({ message: "Forbidden" });
   }
   next();
 };
 
-//checks if the user is an admin — role is written by the Better Auth admin plugin
+/** Checks if the user is an admin */
 const verifyAdmin = async (req, res, next) => {
   const role = String(req.findUser?.role ?? "").toLowerCase();
   if (role !== "admin") {
@@ -329,27 +322,28 @@ const verifyAdmin = async (req, res, next) => {
   next();
 };
 
-//checks if the customer is the customer who is requesting
+/** Ensures customer only fetches their own bookings */
 const realCustomer = async (req, res, next) => {
   const { customerId } = req.query;
-  if (customerId !== req.findUser._id.toString()) {
+  if (customerId && customerId !== req.findUser._id.toString()) {
     return res.status(403).json({ message: "Forbidden" });
   }
-
   next();
 };
 
-// //checks if the customer is authenticated to delete booking
-// const isRealCustomerBookingDelete = async(req,res,next) => {
-//    const _id = toObjectId(req.params.id);
-//    const findBooking = await bookingCollection.findOne()
-
-// }
+// =============================================================================
+// 1. SYSTEM / HEALTH ROUTE
+// =============================================================================
 
 app.get("/", (req, res) => {
   res.send("Hello World!");
 });
 
+// =============================================================================
+// 2. SERVICES DOMAIN ROUTES
+// =============================================================================
+
+/** Create a new service listing (Vendor only) */
 app.post(
   "/services",
   verifyToken,
@@ -365,7 +359,6 @@ app.post(
         ...data,
         price: Number(data.price) || 0,
         imageUrls: Array.isArray(data.imageUrls) ? data.imageUrls : [],
-        // New listings wait for admin approval and are bookable until toggled off.
         status: "pending",
         isAvailable: true,
         createdAt: now,
@@ -384,8 +377,7 @@ app.post(
   },
 );
 
-
-
+/** Featured services for homepage showcase (Only active status) */
 app.get("/featured", async (req, res) => {
   try {
     const result = await serviceCollection
@@ -400,13 +392,12 @@ app.get("/featured", async (req, res) => {
   }
 });
 
-
-
+/** Directory / Admin filtered services query */
 app.get("/services", async (req, res) => {
   try {
     const { vendorId, status, search, category, location, sort } = req.query;
     const filter = {};
-    // const filter = vendorId ? { vendorId: String(vendorId) } : {};
+
     if (vendorId) {
       filter.vendorId = vendorId;
     }
@@ -457,6 +448,7 @@ app.get("/services", async (req, res) => {
   }
 });
 
+/** Single service details */
 app.get("/services/:id", verifyToken, verifyUser, async (req, res) => {
   try {
     const _id = toObjectId(req.params.id);
@@ -477,6 +469,7 @@ app.get("/services/:id", verifyToken, verifyUser, async (req, res) => {
   }
 });
 
+/** Vendor update own service listing */
 app.put(
   "/services/:id",
   verifyToken,
@@ -486,7 +479,6 @@ app.put(
   async (req, res) => {
     try {
       const _id = req.params.id;
-      // Only copy whitelisted fields so documents like _id/vendorId stay intact.
       const body = req.body ?? {};
       const updates = {};
       for (const field of UPDATABLE_SERVICE_FIELDS) {
@@ -523,9 +515,315 @@ app.put(
   },
 );
 
-/**
- * Admin: Get all registered users directory with optional role & search filtering.
- */
+/** Admin-only service moderation status update (Approve/Decline) */
+app.put(
+  "/services/:id/status",
+  verifyToken,
+  verifyUser,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const _id = toObjectId(req.params.id);
+      if (!_id) {
+        return res.status(400).json({ message: "Invalid service id" });
+      }
+
+      const { status } = req.body ?? {};
+      if (!MODERABLE_SERVICE_STATUSES.includes(status)) {
+        return res
+          .status(400)
+          .json({ message: "Status must be 'active' or 'declined'" });
+      }
+
+      const updated = await serviceCollection.findOneAndUpdate(
+        { _id },
+        { $set: { status, updatedAt: new Date().toISOString() } },
+        { returnDocument: "after" },
+      );
+
+      if (!updated) {
+        return res.status(404).json({ message: "Service not found" });
+      }
+
+      res.json(updated);
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  },
+);
+
+/** Delete service (Admin or owning vendor) */
+app.delete(
+  "/services/:id",
+  verifyToken,
+  verifyUser,
+  async (req, res) => {
+    try {
+      const _id = toObjectId(req.params.id);
+      if (!_id) {
+        return res.status(400).json({ message: "Invalid service id" });
+      }
+
+      const role = String(
+        req.findUser?.role ?? req.findUser?.accountType ?? "",
+      ).toLowerCase();
+      const isAdmin = role === "admin";
+      const isVendor =
+        role === "vendor" || req.findUser?.accountType === "vendor";
+
+      if (!isAdmin && !isVendor) {
+        return res.status(403).json({
+          message: "Forbidden: Only admins and vendors can delete services",
+        });
+      }
+
+      // If vendor (and not admin), verify ownership of the service
+      if (!isAdmin) {
+        const service = await serviceCollection.findOne({ _id });
+        if (!service) {
+          return res.status(404).json({ message: "Service not found" });
+        }
+        const userIdStr = req.findUser._id ? req.findUser._id.toString() : "";
+        if (
+          service.vendorId !== userIdStr &&
+          service.vendorEmail !== req.findUser.email
+        ) {
+          return res.status(403).json({
+            message: "Forbidden: You can only delete your own services",
+          });
+        }
+      }
+
+      const result = await serviceCollection.deleteOne({ _id });
+
+      if (result.deletedCount === 0) {
+        return res.status(404).json({ message: "Service not found" });
+      }
+
+      res.json({
+        success: true,
+        deletedId: req.params.id,
+        message: "Service deleted successfully",
+      });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  },
+);
+
+// =============================================================================
+// 3. BOOKINGS DOMAIN ROUTES
+// =============================================================================
+
+/** Customer submits a booking request */
+app.post(
+  "/bookings",
+  verifyToken,
+  verifyUser,
+  verifyCustomer,
+  async (req, res) => {
+    try {
+      const data = req.body;
+      const now = new Date().toISOString();
+
+      const result = await db.collection("bookings").insertOne({
+        ...data,
+        createdAt: now,
+      });
+
+      res.status(201).json(result);
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  },
+);
+
+/** Customer fetches their bookings */
+app.get(
+  "/bookings",
+  verifyToken,
+  verifyUser,
+  verifyCustomer,
+  realCustomer,
+  async (req, res) => {
+    try {
+      const { serviceId, customerId } = req.query;
+      const filter = {};
+      if (serviceId) {
+        filter.serviceId = serviceId;
+      }
+      if (customerId) {
+        filter.customerId = customerId;
+      } else {
+        filter.customerId = req.findUser._id.toString();
+      }
+
+      const bookings = await bookingCollection
+        .find(filter)
+        .sort({ createdAt: -1 })
+        .toArray();
+      res.json(bookings);
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  },
+);
+
+/** Vendor fetches bookings for their services */
+app.get(
+  "/bookings/vendor",
+  verifyToken,
+  verifyUser,
+  verifyVendor,
+  isAuthenticBookingVendor,
+  async (req, res) => {
+    try {
+      const { vendorId, vendorEmail } = req.query;
+      const filter = {};
+      if (vendorId && vendorEmail) {
+        filter.$or = [{ vendorId }, { vendorEmail }];
+      } else if (vendorId) {
+        filter.vendorId = vendorId;
+      } else if (vendorEmail) {
+        filter.vendorEmail = vendorEmail;
+      } else {
+        filter.vendorId = req.findUser._id.toString();
+      }
+
+      const bookings = await bookingCollection
+        .find(filter)
+        .sort({ createdAt: -1 })
+        .toArray();
+      res.json(bookings);
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  },
+);
+
+/** Handler for updating booking status (accept or reject) */
+const updateBookingStatusHandler = async (req, res) => {
+  try {
+    const rawId = req.params.id;
+    const objId = toObjectId(rawId);
+    const filter = objId
+      ? { $or: [{ _id: objId }, { _id: rawId }] }
+      : { _id: rawId };
+
+    const booking = await bookingCollection.findOne(filter);
+    if (!booking) {
+      return res.status(404).json({ message: "Booking not found" });
+    }
+
+    const currentStatus = String(
+      booking.bookingStatus ?? booking.status ?? "pending",
+    ).toLowerCase();
+
+    if (currentStatus !== "pending") {
+      return res.status(400).json({
+        message:
+          "Once accepted or rejected, a request cannot be processed again",
+      });
+    }
+
+    const { status, bookingStatus } = req.body ?? {};
+    const inputStatus = String(bookingStatus ?? status ?? "").toLowerCase();
+
+    if (!["accepted", "rejected", "declined"].includes(inputStatus)) {
+      return res.status(400).json({
+        message: "Status must be 'accepted', 'rejected', or 'declined'",
+      });
+    }
+
+    const targetStatus = inputStatus === "declined" ? "rejected" : inputStatus;
+
+    await bookingCollection.updateOne(filter, {
+      $set: {
+        bookingStatus: targetStatus,
+        status: targetStatus,
+        updatedAt: new Date().toISOString(),
+      },
+    });
+
+    res.json({
+      success: true,
+      status: targetStatus,
+      message: `Booking request has been ${targetStatus}`,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Internal server error" });
+  }
+};
+
+app.put(
+  "/bookings/:id/status",
+  verifyToken,
+  verifyUser,
+  verifyVendor,
+  updateBookingStatusHandler,
+);
+app.patch(
+  "/bookings/:id/status",
+  verifyToken,
+  verifyUser,
+  verifyVendor,
+  updateBookingStatusHandler,
+);
+app.put("/bookings/:id", verifyToken, verifyUser, updateBookingStatusHandler);
+app.patch("/bookings/:id", verifyToken, verifyUser, updateBookingStatusHandler);
+
+/** Customer deletes pending booking request */
+app.delete(
+  "/bookings/:id",
+  verifyToken,
+  verifyUser,
+  verifyCustomer,
+  async (req, res) => {
+    try {
+      const _id = toObjectId(req.params.id);
+      if (!_id) {
+        return res.status(400).json({ message: "Invalid booking id" });
+      }
+
+      const booking = await bookingCollection.findOne({ _id });
+      if (!booking) {
+        return res.status(404).json({ message: "Booking not found" });
+      }
+
+      if (req.findUser._id.toString() !== booking.customerId) {
+        return res.status(403).json({ message: "Forbidden" });
+      }
+
+      const status = String(
+        booking.bookingStatus ?? booking.status ?? "pending",
+      ).toLowerCase();
+
+      if (status !== "pending") {
+        return res
+          .status(403)
+          .json({ message: "Only pending bookings can be deleted" });
+      }
+
+      await bookingCollection.deleteOne({ _id });
+      res.json({ success: true, deletedId: req.params.id });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  },
+);
+
+// =============================================================================
+// 4. USERS & ADMIN AUDIT ROUTES
+// =============================================================================
+
+/** Admin: Get all registered users directory with optional role & search filtering */
 app.get(
   "/users",
   verifyToken,
@@ -565,21 +863,20 @@ app.get(
   },
 );
 
-/**
- * Admin: Block or unblock a registered user.
- */
+/** Admin: Block or unblock a registered user */
 const handleBlockUser = async (req, res) => {
   try {
     const rawId = req.params.id;
     const objId = toObjectId(rawId);
-    const filter = objId ? { $or: [{ _id: objId }, { _id: rawId }] } : { _id: rawId };
+    const filter = objId
+      ? { $or: [{ _id: objId }, { _id: rawId }] }
+      : { _id: rawId };
 
     const targetUser = await userCollection.findOne(filter);
     if (!targetUser) {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Prevent admin from blocking their own account
     if (targetUser._id.toString() === req.findUser._id.toString()) {
       return res
         .status(400)
@@ -609,14 +906,22 @@ const handleBlockUser = async (req, res) => {
   }
 };
 
-app.put("/users/:id/block", verifyToken, verifyUser, verifyAdmin, handleBlockUser);
-app.patch("/users/:id/block", verifyToken, verifyUser, verifyAdmin, handleBlockUser);
+app.put(
+  "/users/:id/block",
+  verifyToken,
+  verifyUser,
+  verifyAdmin,
+  handleBlockUser,
+);
+app.patch(
+  "/users/:id/block",
+  verifyToken,
+  verifyUser,
+  verifyAdmin,
+  handleBlockUser,
+);
 
-/**
- * Admin: Get all transactions audit logs.
- * Note: Payment status is determined solely by Stripe events.
- * Admins are not allowed to manually modify payment records.
- */
+/** Admin: Get all transactions audit logs */
 app.get(
   "/transactions",
   verifyToken,
@@ -666,421 +971,11 @@ app.get(
   },
 );
 
-/**
- * Admin-only moderation endpoint — approves (active) or declines a listing so
- * it enters/leaves the public directory. Kept separate from the vendor PUT so
- * only admins can change `status`.
- */
-app.put(
-  "/services/:id/status",
-  verifyToken,
-  verifyUser,
-  verifyAdmin,
-  async (req, res) => {
-    try {
-      const _id = toObjectId(req.params.id);
-      if (!_id) {
-        return res.status(400).json({ message: "Invalid service id" });
-      }
+// =============================================================================
+// 5. STRIPE PAYMENT & SUBSCRIPTION ROUTES
+// =============================================================================
 
-      const { status } = req.body ?? {};
-      if (!MODERABLE_SERVICE_STATUSES.includes(status)) {
-        return res
-          .status(400)
-          .json({ message: "Status must be 'active' or 'declined'" });
-      }
-
-      const updated = await serviceCollection.findOneAndUpdate(
-        { _id },
-        { $set: { status, updatedAt: new Date().toISOString() } },
-        { returnDocument: "after" },
-      );
-
-      if (!updated) {
-        return res.status(404).json({ message: "Service not found" });
-      }
-
-      res.json(updated);
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ message: "Internal server error" });
-    }
-  },
-);
-
-app.delete(
-  "/services/:id",
-  verifyToken,
-  verifyUser,
-  async (req, res) => {
-    try {
-      const _id = toObjectId(req.params.id);
-      if (!_id) {
-        return res.status(400).json({ message: "Invalid service id" });
-      }
-
-      const role = String(
-        req.findUser?.role ?? req.findUser?.accountType ?? ""
-      ).toLowerCase();
-      const isAdmin = role === "admin";
-      const isVendor =
-        role === "vendor" || req.findUser?.accountType === "vendor";
-
-      if (!isAdmin && !isVendor) {
-        return res.status(403).json({
-          message: "Forbidden: Only admins and vendors can delete services",
-        });
-      }
-
-      // If vendor (and not admin), verify ownership of the service
-      if (!isAdmin) {
-        const service = await serviceCollection.findOne({ _id });
-        if (!service) {
-          return res.status(404).json({ message: "Service not found" });
-        }
-        const userIdStr = req.findUser._id ? req.findUser._id.toString() : "";
-        if (
-          service.vendorId !== userIdStr &&
-          service.vendorEmail !== req.findUser.email
-        ) {
-          return res.status(403).json({
-            message: "Forbidden: You can only delete your own services",
-          });
-        }
-      }
-
-      const result = await serviceCollection.deleteOne({ _id });
-
-      if (result.deletedCount === 0) {
-        return res.status(404).json({ message: "Service not found" });
-      }
-
-      res.json({
-        success: true,
-        deletedId: req.params.id,
-        message: "Service deleted successfully",
-      });
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ message: "Internal server error" });
-    }
-  },
-);
-
-app.post(
-  "/bookings",
-  verifyToken,
-  verifyUser,
-  verifyCustomer,
-  async (req, res) => {
-    try {
-      const data = req.body;
-      const now = new Date().toISOString();
-
-      const result = await db.collection("bookings").insertOne({
-        ...data,
-        createdAt: now,
-      });
-
-      res.status(201).json(result);
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ message: "Internal server error" });
-    }
-  },
-);
-
-app.get(
-  "/bookings",
-  verifyToken,
-  verifyUser,
-  verifyCustomer,
-  realCustomer,
-  async (req, res) => {
-    try {
-      const { serviceId, customerId } = req.query;
-      const filter = {};
-      if (serviceId) {
-        filter.serviceId = serviceId;
-      }
-      if (customerId) {
-        filter.customerId = customerId;
-      }
-
-      // // Service-scoped lookups back the "already requested?" panel, which expects one record.
-      // if (serviceId) {
-      //   const booking = await bookingCollection.find(filter)
-      //   return res.json(booking)
-      // }
-
-      // Customer lookups list every request, newest first.
-      const bookings = await bookingCollection
-        .find(filter)
-        .sort({ createdAt: -1 })
-        .toArray();
-      res.json(bookings);
-    } catch (err) {
-      console.log(err);
-      res.status(500).json({ message: "Internal server error" });
-    }
-  },
-);
-
-
-
-app.get("/bookings/vendor",verifyToken, verifyUser, verifyVendor, isAuthenticBookingVendor, async (req, res) => {
-  try {
-    const { vendorId, vendorEmail } = req.query;
-    const filter = {};
-    if (vendorId && vendorEmail) {
-      filter.$or = [{ vendorId }, { vendorEmail }];
-    } else if (vendorId) {
-      filter.vendorId = vendorId;
-    } else if (vendorEmail) {
-      filter.vendorEmail = vendorEmail;
-    }
-
-    const bookings = await bookingCollection
-      .find(filter)
-      .sort({ createdAt: -1 })
-      .toArray();
-    res.json(bookings);
-  } catch (err) {
-    console.log(err);
-    res.status(500).json({ message: "Internal server error" });
-  }
-});
-
-/**
- * Updates a booking request status (accept or reject).
- * Rules:
- * 1. Only pending requests can be accepted or rejected.
- * 2. Once accepted or rejected, a request cannot be processed again.
- */
-const updateBookingStatusHandler = async (req, res) => {
-  try {
-    const rawId = req.params.id;
-    const objId = toObjectId(rawId);
-    const filter = objId ? { $or: [{ _id: objId }, { _id: rawId }] } : { _id: rawId };
-
-    const booking = await bookingCollection.findOne(filter);
-    if (!booking) {
-      return res.status(404).json({ message: "Booking not found" });
-    }
-
-    const currentStatus = String(
-      booking.bookingStatus ?? booking.status ?? "pending"
-    ).toLowerCase();
-
-    // Rule: Only pending requests can be processed. Once accepted or rejected, cannot be processed again.
-    if (currentStatus !== "pending") {
-      return res.status(400).json({
-        message: "Once accepted or rejected, a request cannot be processed again",
-      });
-    }
-
-    const { status, bookingStatus } = req.body ?? {};
-    const inputStatus = String(bookingStatus ?? status ?? "").toLowerCase();
-
-    if (!["accepted", "rejected", "declined"].includes(inputStatus)) {
-      return res.status(400).json({
-        message: "Status must be 'accepted', 'rejected', or 'declined'",
-      });
-    }
-
-    // Standardize status: store both bookingStatus and status for compatibility
-    const targetStatus = inputStatus === "declined" ? "rejected" : inputStatus;
-
-    await bookingCollection.updateOne(filter, {
-      $set: {
-        bookingStatus: targetStatus,
-        status: targetStatus,
-        updatedAt: new Date().toISOString(),
-      },
-    });
-
-    res.json({
-      success: true,
-      status: targetStatus,
-      message: `Booking request has been ${targetStatus}`,
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Internal server error" });
-  }
-};
-
-app.put("/bookings/:id/status",verifyToken, verifyUser,verifyVendor, updateBookingStatusHandler);
-app.patch("/bookings/:id/status", verifyToken, verifyUser,verifyVendor, updateBookingStatusHandler);
-app.put("/bookings/:id", verifyToken, verifyUser, updateBookingStatusHandler);
-app.patch("/bookings/:id", verifyToken, verifyUser, updateBookingStatusHandler);
-
-/** Deletes a customer's booking request — only while it is still pending. */
-app.delete(
-  "/bookings/:id",
-  verifyToken,
-  verifyUser,
-  verifyCustomer,
-  async (req, res) => {
-    try {
-      const _id = toObjectId(req.params.id);
-      if (!_id) {
-        return res.status(400).json({ message: "Invalid booking id" });
-      }
-
-      const booking = await bookingCollection.findOne({ _id });
-      if (!booking) {
-        return res.status(404).json({ message: "Booking not found" });
-      }
-
-      if (req.findUser._id.toString() !== booking.customerId) {
-        return res.status(403).json({ message: "Forbidden" });
-      }
-
-      const status = String(
-        booking.bookingStatus ?? booking.status ?? "pending",
-      ).toLowerCase();
-
-      if (status !== "pending") {
-        return res
-          .status(403)
-          .json({ message: "Only pending bookings can be deleted" });
-      }
-
-      await bookingCollection.deleteOne({ _id });
-
-      res.json({ success: true, deletedId: req.params.id });
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ message: "Internal server error" });
-    }
-  },
-);
-
-// app.post("/create-checkout-session", verifyToken,verifyUser, async (req, res) => {
-//   try {
-//     const payload = req.body ?? {};
-//     console.log("Create checkout session payload:", payload);
-
-//     if (!payload.id && !payload.email) {
-//       return res.status(400).json({ error: "User ID or email is required" });
-//     }
-
-//     // Lookup user by ObjectId, string _id, or email
-//     const queryConditions = [];
-//     const objId = toObjectId(payload.id);
-//     if (objId) queryConditions.push({ _id: objId });
-//     if (payload.id) queryConditions.push({ _id: payload.id });
-//     if (payload.email) queryConditions.push({ email: payload.email });
-
-//     const user = await userCollection.findOne({ $or: queryConditions });
-
-//     if (!user) {
-//       return res.status(404).json({ error: "User not found" });
-//     }
-
-//     const userId = (user._id || payload.id).toString();
-//     const userEmail = user.email || payload.email;
-
-//     // Record transaction in database with status 'unpaid'
-//     const userStatusInfo = {
-//       userId,
-//       userEmail,
-//       amount: 99,
-//       plan: "free",
-//       status: "unpaid",
-//       createdAt: new Date(),
-//     };
-//     const paymentConfirmationResult =
-//       await transactionCollection.insertOne(userStatusInfo);
-
-//     // Ensure client URL has protocol
-//     let clientUrl = process.env.CLIENT_URL ;
-//     if (!clientUrl.startsWith("http://") && !clientUrl.startsWith("https://")) {
-//       clientUrl = `http://${clientUrl}`;
-//     }
-
-//     // Create Stripe Checkout session
-//     const session = await stripe.checkout.sessions.create({
-//       success_url: `${clientUrl}/dashboard/vendor/success_payment?session_id={CHECKOUT_SESSION_ID}`,
-//       cancel_url: `${clientUrl}/dashboard/vendor/cancel_payment`,
-//       customer_email: userEmail,
-//       line_items: [
-//         {
-//           price_data: {
-//             currency: "usd",
-//             unit_amount: 99 * 100, // $99.00 in cents
-//             product_data: {
-//               name: "WedPlan Premium Vendor Membership",
-//               description:
-//                 "Unlimited service listings and verified vendor badge",
-//             },
-//           },
-//           quantity: 1,
-//         },
-//       ],
-//       mode: "payment",
-//       metadata: {
-//         paymentId: paymentConfirmationResult.insertedId.toString(),
-//         userId,
-//         userEmail,
-//       },
-//     });
-
-//     const retrieveStripeSession = await stripe.checkout.sessions.retrieve(
-//       session.id,
-//     );
-
-//     const { status, customer_email, payment_status, metadata, payment_intent } = retrieveStripeSession
-
-//     // console.log(
-//     //   status,
-//     //   customer_email,
-//     //   payment_status,
-//     //   metadata,
-//     //   payment_intent,
-//     // );
-
-//     // If there's session.id after stripe checking
-//     // if (session && session.id) {
-//     //   const ninetyDays = new Date();
-//     //   ninetyDays.setDate(ninetyDays.getDate() + 90);
-
-//     //   // 1. Change the collection "transaction" status to paid
-//     //   await transactionCollection.updateOne(
-//     //     { _id: paymentConfirmationResult.insertedId },
-//     //     {
-//     //       $set: {
-//     //         status: "paid",
-//     //         sessionId: session.id,
-//     //         paidAt: new Date(),
-//     //       },
-//     //     },
-//     //   );
-
-//       // 2. Update user collection subscriptionPlan : "Premium" and add subscriptionExpiresAt : (after 90 days)
-//     //   await userCollection.updateOne(
-//     //     { _id: user._id },
-//     //     {
-//     //       $set: {
-//     //         subscriptionPlan: "premium",
-//     //         subscriptionExpiresAt: ninetyDays,
-//     //       },
-//     //     },
-//     //   );
-//     // }
-//     // console.log("session",session)
-//     // console.log("retrieved session",retrieveStripeSession)
-//     res.json({ success: true, url: session.url, sessionId: session.id });
-//   } catch (err) {
-//     console.error("Failed to create checkout session:", err);
-//     res.status(500).json({
-//       error: "Internal server error",
-//       message: err.message || "Failed to create checkout session",
-//     });
-//   }
-// });
-
+/** Create Stripe Checkout session for Premium vendor membership */
 app.post(
   "/create-checkout-session",
   verifyToken,
@@ -1097,19 +992,15 @@ app.post(
         });
       }
 
-      // Find user
       const queryConditions = [];
-
       const objId = toObjectId(payload.id);
 
       if (objId) {
         queryConditions.push({ _id: objId });
       }
-
       if (payload.id) {
         queryConditions.push({ _id: payload.id });
       }
-
       if (payload.email) {
         queryConditions.push({ email: payload.email });
       }
@@ -1158,37 +1049,32 @@ app.post(
       paymentId = transactionResult.insertedId;
 
       // Validate frontend URL
-      const clientUrl = new URL(process.env.CLIENT_URL).origin;
+      const clientUrl = new URL(
+        process.env.CLIENT_URL || "http://localhost:3000",
+      ).origin;
 
       // Create Stripe Checkout Session
       const checkoutSession = await stripe.checkout.sessions.create({
         mode: "payment",
-
         success_url:
           `${clientUrl}/dashboard/vendor/success_payment` +
           `?session_id={CHECKOUT_SESSION_ID}`,
-
         cancel_url: `${clientUrl}/dashboard/vendor/cancel_payment`,
-
         customer_email: userEmail,
-
         line_items: [
           {
             price_data: {
               currency: "usd",
               unit_amount: 9900,
-
               product_data: {
                 name: "WedPlan Premium Vendor Membership",
                 description:
                   "Unlimited service listings and verified vendor badge",
               },
             },
-
             quantity: 1,
           },
         ],
-
         metadata: {
           paymentId: paymentId.toString(),
           userId,
@@ -1206,7 +1092,6 @@ app.post(
         },
       );
 
-      // Return checkout URL to frontend
       return res.status(200).json({
         success: true,
         url: checkoutSession.url,
@@ -1215,7 +1100,6 @@ app.post(
     } catch (err) {
       console.error("Checkout session error:", err);
 
-      // Mark failed checkout creation
       if (paymentId) {
         await transactionCollection
           .updateOne(
@@ -1237,12 +1121,7 @@ app.post(
   },
 );
 
-/**
- * Verify payment endpoint:
- * Checks session with Stripe after checkout redirect and ensures transaction
- * status is updated to "paid" and user subscription is set to "Premium" with 90-day expiry.
- */
-
+/** Verify payment session after checkout redirect */
 app.post("/verify-payment", verifyToken, verifyUser, async (req, res) => {
   try {
     const { sessionId } = req.body ?? {};
@@ -1253,10 +1132,7 @@ app.post("/verify-payment", verifyToken, verifyUser, async (req, res) => {
       });
     }
 
-    // 1. Retrieve Checkout Session from Stripe
     const session = await stripe.checkout.sessions.retrieve(sessionId);
-
-    // 2. Verify that this session belongs to the logged-in user
     const userId = req.findUser._id.toString();
 
     if (session.metadata?.userId !== userId) {
@@ -1275,7 +1151,6 @@ app.post("/verify-payment", verifyToken, verifyUser, async (req, res) => {
       });
     }
 
-    // 3. Stripe has not confirmed the money yet (e.g. delayed payment method)
     if (session.payment_status !== "paid") {
       return res.status(200).json({
         success: false,
@@ -1284,8 +1159,6 @@ app.post("/verify-payment", verifyToken, verifyUser, async (req, res) => {
       });
     }
 
-    // 4. Rediscover the transaction and activate premium. Stripe already
-    // confirmed the payment above, so this also covers a missed webhook.
     const result = await activatePremiumSubscription(session);
 
     if (!result.found) {
@@ -1309,7 +1182,6 @@ app.post("/verify-payment", verifyToken, verifyUser, async (req, res) => {
       });
     }
 
-    // 5. Return actual subscription details from MongoDB
     const user = await userCollection.findOne({
       _id: req.findUser._id,
     });
@@ -1323,16 +1195,39 @@ app.post("/verify-payment", verifyToken, verifyUser, async (req, res) => {
     });
   } catch (err) {
     console.error("Payment verification failed:", err);
-
     return res.status(500).json({
       error: "Failed to verify payment",
     });
   }
 });
 
+// =============================================================================
+// 6. 404 CATCH-ALL & GLOBAL ERROR HANDLING
+// =============================================================================
+
+/** Catch-all for undefined routes — ensures JSON response rather than default HTML */
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    message: `Cannot ${req.method} ${req.originalUrl}`,
+  });
+});
+
+/** Global error handler for unhandled exceptions in middleware/handlers */
+app.use((err, req, res, _next) => {
+  console.error("Unhandled server exception:", err);
+  res.status(err.status || 500).json({
+    success: false,
+    message: err.message || "Internal server error",
+  });
+});
+
+// =============================================================================
+// 7. SERVER LISTEN
+// =============================================================================
+
 app.listen(port, () => {
   console.log(`Server is running on Port ${port}`);
 });
-
 
 export default app;
