@@ -17,8 +17,8 @@ Backend REST API for **WedPlan — Wedding Planning Platform**, powered by Node.
 Create a `.env` file in the root of `wedplan_server`:
 
 ```env
-PORT=8000
-MONGODB_URI=mongodb+srv://<username>:<password>@cluster.mongodb.net/wedplan?retryWrites=true&w=majority
+PORT
+MONGODB_URI
 CLIENT_URL=http://localhost:3000
 
 # Stripe Secret & Webhook Keys (Test Mode)
@@ -80,4 +80,4 @@ The server will bind to `http://localhost:8000`.
 ---
 
 ## 🛡️ License
-Assignment 9 (Category: 004) - WedPlan Platform.
+Distributed under the MIT License. See LICENSE for more information.
