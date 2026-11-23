@@ -6,32 +6,47 @@ import Stripe from "stripe";
 
 const app = express();
 const port = 8000;
-// const client = new MongoClient(process.env.MONGODB_URI);
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const globalForMongo = globalThis;
 
-const client =
-  globalForMongo.mongoClient ??
-  new MongoClient(process.env.MONGODB_URI, {
-    maxPoolSize: 5, // free Atlas has a connection limit
-    serverSelectionTimeoutMS: 10000, // fail fast instead of waiting 30s
-    maxIdleTimeMS: 5000, // drop idle connections before they go stale
-  });
+export function connectToMongoDB() {
+  if (!globalForMongo.mongoClientPromise) {
+    const client = new MongoClient(process.env.MONGODB_URI, {
+      maxPoolSize: 5, // free Atlas has a connection limit
+      serverSelectionTimeoutMS: 10000, // fail fast instead of waiting 30s
+      maxIdleTimeMS: 5000, // drop idle connections before they go stale
+    });
 
-globalForMongo.mongoClient = client;
-await client.connect();
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+    const promise = client.connect();
 
-export async function connectToMongoDB() {
-  try {
-    await client.connect();
-    console.log("You successfully connected to MongoDB!");
-    return client;
-  } catch (err) {
-    console.dir(err);
+    promise.catch((err) => {
+      console.error("MongoDB connection failed:", err);
+      globalForMongo.mongoClientPromise = undefined; // retry on the next request
+      client.close().catch(() => {});
+    });
+
+    globalForMongo.mongoClientPromise = promise;
   }
+  return globalForMongo.mongoClientPromise;
 }
 
-connectToMongoDB();
+// 
+
+// export async function getCollections() {
+//   const client = await connectToMongoDB();
+//   const db = client.db("wedplan");
+
+//   return {
+//     userCollection: db.collection("user"),
+//     serviceCollection: db.collection("services"),
+//     bookingCollection: db.collection("bookings"),
+//     transactionCollection: db.collection("transaction"),
+//     sessionCollection: db.collection("session"),
+//   };
+// }
+
+const client = await connectToMongoDB();
+
 
 const db = client.db("wedplan");
 const userCollection = db.collection("user");
@@ -41,6 +56,15 @@ const transactionCollection = db.collection("transaction");
 const sessionCollection = db.collection("session");
 
 app.use(cors());
+
+app.use(async (req, res, next) => {
+  try {
+    await connectToMongoDB();
+    next();
+  } catch (err) {
+    res.status(503).json({ error: "Database unavailable, please try again" });
+  }
+});
 
 //stripe webhook
 
